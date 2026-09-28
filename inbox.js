@@ -20,10 +20,18 @@ const RELAY = 'https://ntfy.sh';
 const { UPLOAD_TOPIC: TOPIC, UPLOAD_PRIVATE: PRIV, DATA_REPO } = process.env;
 const DATA_DIR = 'Source of the Incentive';
 const BRANCHES = ['SGH-Cairo', 'SGH-Alex'];
-// What may be uploaded from the online page (category -> folder, allowed departments).
+// What may be uploaded from the online page: category -> folder, and its departments.
+// units: the only departments allowed (one per upload); anyUnit: a whole-month file, or one specialty.
 const ALLOWED = {
   allied: { folder: 'Allied', units: ['Anesthesia', 'Emergency Room', 'Intensive Care Unit', 'Laboratory', 'Radiation Oncology', 'Medical Imaging', 'Physiotherapy', 'Pharmacy', 'Home care'] },
+  opd: { folder: 'OPD', anyUnit: true },
+  residents: { folder: 'Residents', anyUnit: true },
 };
+// letters, digits, spaces and a few marks; no slashes and no ".." (it becomes a folder name)
+const SAFE_UNIT = /^[\p{L}\p{N}][\p{L}\p{N} ,&()'-]{0,59}$/u;
+const ID_NAMES = ['id', 'employeeid', 'empid', 'code', 'doctorid', 'doctorcode', 'staffid', 'empno', 'employeeno', 'employeecode', 'empcode'];
+const NAME_NAMES = ['name', 'doctor', 'doctorname', 'employeename', 'fullname'];
+const PAY_NAMES = ['incentives', 'incentive', 'totalsalary', 'salary', 'basicsalary', 'monthlyrevenue', 'revenue', 'grossincentives', 'finalincentives'];
 const MAX_BYTES = 5 * 1024 * 1024;
 const work = path.join(process.cwd(), 'data-repo');
 
@@ -42,30 +50,36 @@ function decrypt(body) {
   return JSON.parse(Buffer.concat([d.update(data.subarray(0, data.length - 16)), d.final()]).toString('utf8'));
 }
 
-/** The workbook must open and have a header with ID and Name (and a pay column); count its people. */
+/**
+ * The workbook must open and have the template's table: a header (row 1, or under the department
+ * figures) with ID and Name — or, like Home care's, Month and Incentives only — and at least one row.
+ */
 async function inspect(buffer) {
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buffer);
   for (const ws of wb.worksheets) {
-    for (let r = 1; r <= Math.min(10, ws.rowCount); r++) {
+    for (let r = 1; r <= Math.min(15, ws.rowCount); r++) {
       const cols = {};
-      ws.getRow(r).eachCell((c, i) => { cols[norm(c.text)] = i; });
-      if (!(cols.id && cols.name)) continue;
-      if (!(cols.incentives || cols.incentive || cols.totalsalary || cols.salary)) return { error: 'the file has no Incentives / Total Salary column' };
+      ws.getRow(r).eachCell((c, i) => { const k = norm(c.text); if (!cols[k]) cols[k] = i; });
+      const find = (names) => names.map((n) => cols[n]).find(Boolean);
+      const idCol = find(ID_NAMES); const nameCol = find(NAME_NAMES); const payCol = find(PAY_NAMES);
+      const people = idCol && nameCol;
+      if (!people && !(cols.month && payCol)) continue;
+      if (!payCol) return { error: 'the file has no Incentives / Total Salary column' };
       let rows = 0;
       const months = new Set();
       for (let k = r + 1; k <= ws.rowCount; k++) {
         const row = ws.getRow(k);
-        const id = row.getCell(cols.id).text.trim();
-        const name = row.getCell(cols.name).text.trim();
-        if (!id && !name) continue;
+        const has = people ? row.getCell(idCol).text.trim() || row.getCell(nameCol).text.trim() : row.getCell(payCol).text.trim();
+        if (!has) continue;
         rows++;
-        if (cols.month) months.add(`${row.getCell(cols.month).text.trim()}${cols.year ? ` ${row.getCell(cols.year).text.trim()}` : ''}`);
+        const m = cols.month ? row.getCell(cols.month).text.trim() : '';
+        if (m) months.add(`${m}${cols.year ? ` ${row.getCell(cols.year).text.trim()}` : ''}`);
       }
-      return rows ? { rows, months: [...months].filter(Boolean) } : { error: 'no rows with an ID or a name' };
+      return rows ? { rows, months: [...months].filter(Boolean) } : { error: 'the table in the file is empty' };
     }
   }
-  return { error: 'no sheet with ID and Name columns (use the department template)' };
+  return { error: 'the file is not a dashboard template (no ID and Name columns)' };
 }
 
 async function status(list) {
@@ -105,9 +119,10 @@ async function status(list) {
     }
     const fail = (note) => { statuses.push({ ref: p.ref, ok: false, note }); console.log(`${msg.id}: rejected — ${note}`); };
     const allow = ALLOWED[p.category];
-    if (!allow) { fail('uploads from the online page are open for Allied / Closed Departments only'); continue; }
+    if (!allow) { fail('uploads from the online page are open for Allied / Closed Departments, OPD and Residents only'); continue; }
     if (!BRANCHES.includes(p.branch)) { fail(`unknown branch ${p.branch}`); continue; }
-    if (!allow.units.includes(p.unit)) { fail(`unknown department ${p.unit}`); continue; }
+    if (allow.units && !allow.units.includes(p.unit)) { fail(`unknown department ${p.unit}`); continue; }
+    if (allow.anyUnit && p.unit && !SAFE_UNIT.test(p.unit)) { fail('the specialty name has characters that are not allowed'); continue; }
     const buffer = Buffer.from(String(p.data || ''), 'base64');
     if (buffer.length > MAX_BYTES) { fail('the file is larger than 5 MB'); continue; }
     if (buffer.subarray(0, 2).toString('latin1') !== 'PK') { fail('not an Excel .xlsx file'); continue; }
@@ -116,10 +131,10 @@ async function status(list) {
     if (info.error) { fail(info.error); continue; }
     const stamp = new Date(msg.time * 1000).toISOString().slice(0, 16).replace(/[-:T]/g, '');
     const safe = String(p.name || 'upload.xlsx').replace(/[^\w .()&-]+/g, '_').replace(/\.xlsx?$/i, '').slice(0, 80);
-    const rel = path.posix.join(DATA_DIR, p.branch, allow.folder, p.unit, `${stamp} ${safe}.xlsx`);
+    const rel = path.posix.join(DATA_DIR, p.branch, allow.folder, ...(p.unit ? [p.unit] : []), `${stamp} ${safe}.xlsx`);
     fs.mkdirSync(path.join(work, path.dirname(rel)), { recursive: true });
     fs.writeFileSync(path.join(work, rel), buffer);
-    filed.push(`${p.unit} (${String(p.by || 'unknown').slice(0, 40)})`);
+    filed.push(`${p.unit || allow.folder} (${String(p.by || 'unknown').slice(0, 40)})`);
     statuses.push({ ref: p.ref, ok: true, note: `${info.rows} rows${info.months.length ? ` · ${info.months.join(', ')}` : ''}` });
     console.log(`${msg.id}: ${rel} · ${info.rows} rows`);
   }
