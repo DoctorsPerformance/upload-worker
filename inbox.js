@@ -2,9 +2,10 @@
 //
 // The online dashboard cannot write files itself: a signed-in person's browser encrypts the
 // workbook to this worker's public key and posts it to a private ntfy.sh topic. Here we read the
-// topic, decrypt each new upload, check it is an Excel file for an allowed department with ID and
-// Name columns, and commit it into that department's folder of the private data repository
-// ("<branch>/Allied/<department>/…xlsx"). That push starts the dashboard's own publish workflow,
+// topic, decrypt each new upload, check it strictly against its page's template (the same check the
+// page runs: public/template-check.js and public/templates/ of the data repository — every column,
+// the figures above the table filled in, a real branch / month / year on every row), and commit it
+// into that page's folder of the private data repository ("<branch>/Allied/<department>/…xlsx"). That push starts the dashboard's own publish workflow,
 // which merges the department's rows into its month files and rebuilds the site.
 // A short status ({ ref, ok, note }, no personal data) goes back so the page can tell the uploader.
 //
@@ -24,8 +25,14 @@ const BRANCHES = ['SGH-Cairo', 'SGH-Alex'];
 // units: the only departments allowed (one per upload); anyUnit: a whole-month file, or one specialty.
 const ALLOWED = {
   allied: { folder: 'Allied', units: ['Anesthesia', 'Emergency Room', 'Intensive Care Unit', 'Laboratory', 'Radiation Oncology', 'Medical Imaging', 'Physiotherapy', 'Pharmacy', 'Home care'] },
+  bd: { folder: 'Separate/Business Development', units: ['Corporate Sales', 'External Doctors', 'IVP Visiting Professors'] },
   opd: { folder: 'OPD', anyUnit: true },
   residents: { folder: 'Residents', anyUnit: true },
+  admission: { folder: 'Separate/Admission & Discharge', anyUnit: true },
+  patientrel: { folder: 'Separate/Patient Relation', anyUnit: true },
+  legal: { folder: 'Separate/Legal Affairs', anyUnit: true },
+  collection: { folder: 'Separate/CAM Collection', anyUnit: true },
+  quarterly: { folder: 'Quarterly', anyUnit: true },
 };
 // letters, digits, spaces and a few marks; no slashes and no ".." (it becomes a folder name)
 const SAFE_UNIT = /^[\p{L}\p{N}][\p{L}\p{N} ,&()'-]{0,59}$/u;
@@ -82,6 +89,38 @@ async function inspect(buffer) {
   return { error: 'the file is not a dashboard template (no ID and Name columns)' };
 }
 
+// A sheet as rows of cell values (what template-check.js reads).
+const cellValue = (v) => {
+  if (v && typeof v === 'object' && !(v instanceof Date)) {
+    if ('result' in v) return v.result;
+    if (v.richText) return v.richText.map((t) => t.text).join('');
+    if ('text' in v) return v.text;
+    return null;
+  }
+  return v;
+};
+function gridOf(ws) {
+  const g = [];
+  ws.eachRow({ includeEmpty: true }, (row, r) => { const a = []; row.eachCell({ includeEmpty: false }, (c, i) => { a[i - 1] = cellValue(c.value); }); g[r - 1] = a; });
+  for (let i = 0; i < g.length; i++) if (!g[i]) g[i] = [];
+  return g;
+}
+async function firstSheet(src) {
+  const wb = new ExcelJS.Workbook();
+  if (Buffer.isBuffer(src)) await wb.xlsx.load(src); else await wb.xlsx.readFile(src);
+  if (!wb.worksheets.length) throw new Error('no sheet');
+  return gridOf(wb.worksheets[0]);
+}
+/** The page's template check (from the data repository), or null when the page has no template. */
+async function templateCheck(TC, p, buffer) {
+  const key = TC.templateKey(p.category, p.unit);
+  if (!key) return null;
+  const tpl = await firstSheet(path.join(work, 'public', 'templates', TC.TEMPLATES[key]));
+  let grid;
+  try { grid = await firstSheet(buffer); } catch { return { ok: false, errors: ['the file could not be opened as Excel'] }; }
+  return TC.validate(grid, tpl, { branch: p.branch, unit: p.unit || null, name: TC.TEMPLATES[key].replace(/\.xlsx$/i, '') });
+}
+
 async function status(list) {
   for (const st of list) {
     await fetch(`${RELAY}/${TOPIC}s`, { method: 'POST', body: JSON.stringify(st), headers: { 'Content-Type': 'text/plain' } }).catch(() => {});
@@ -100,6 +139,7 @@ async function status(list) {
   git('config', 'user.name', 'dashboard-upload');
   git('config', 'user.email', 'dashboard-upload@users.noreply.github.com');
   const doneFile = path.join(work, 'uploads', 'processed.json');
+  const TC = require(path.join(work, 'public', 'template-check.js'));
   let done = [];
   try { done = JSON.parse(fs.readFileSync(doneFile, 'utf8')); } catch { /* first upload */ }
   const fresh = messages.filter((m) => !done.includes(m.id));
@@ -119,16 +159,22 @@ async function status(list) {
     }
     const fail = (note) => { statuses.push({ ref: p.ref, ok: false, note }); console.log(`${msg.id}: rejected — ${note}`); };
     const allow = ALLOWED[p.category];
-    if (!allow) { fail('uploads from the online page are open for Allied / Closed Departments, OPD and Residents only'); continue; }
+    if (!allow) { fail('this page does not take uploads from the online dashboard yet'); continue; }
     if (!BRANCHES.includes(p.branch)) { fail(`unknown branch ${p.branch}`); continue; }
     if (allow.units && !allow.units.includes(p.unit)) { fail(`unknown department ${p.unit}`); continue; }
     if (allow.anyUnit && p.unit && !SAFE_UNIT.test(p.unit)) { fail('the specialty name has characters that are not allowed'); continue; }
     const buffer = Buffer.from(String(p.data || ''), 'base64');
     if (buffer.length > MAX_BYTES) { fail('the file is larger than 5 MB'); continue; }
     if (buffer.subarray(0, 2).toString('latin1') !== 'PK') { fail('not an Excel .xlsx file'); continue; }
+    let check;
+    try { check = await templateCheck(TC, p, buffer); } catch (err) { check = { ok: false, errors: [`the template could not be checked (${err.message})`] }; }
+    if (check && !check.ok) { fail(`not accepted — ${TC.summary(check.errors, 5).replace(/\n/g, ' · ')}`); continue; }
     let info;
-    try { info = await inspect(buffer); } catch { info = { error: 'the file could not be opened as Excel' }; }
-    if (info.error) { fail(info.error); continue; }
+    if (check) info = { rows: check.rows, months: [check.month] };
+    else {
+      try { info = await inspect(buffer); } catch { info = { error: 'the file could not be opened as Excel' }; }
+      if (info.error) { fail(info.error); continue; }
+    }
     const stamp = new Date(msg.time * 1000).toISOString().slice(0, 16).replace(/[-:T]/g, '');
     const safe = String(p.name || 'upload.xlsx').replace(/[^\w .()&-]+/g, '_').replace(/\.xlsx?$/i, '').slice(0, 80);
     const rel = path.posix.join(DATA_DIR, p.branch, allow.folder, ...(p.unit ? [p.unit] : []), `${stamp} ${safe}.xlsx`);
