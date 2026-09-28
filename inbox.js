@@ -1,0 +1,136 @@
+// Upload worker (runs on a schedule in the public "upload-worker" repository).
+//
+// The online dashboard cannot write files itself: a signed-in person's browser encrypts the
+// workbook to this worker's public key and posts it to a private ntfy.sh topic. Here we read the
+// topic, decrypt each new upload, check it is an Excel file for an allowed department with ID and
+// Name columns, and commit it into that department's folder of the private data repository
+// ("<branch>/Allied/<department>/…xlsx"). That push starts the dashboard's own publish workflow,
+// which merges the department's rows into its month files and rebuilds the site.
+// A short status ({ ref, ok, note }, no personal data) goes back so the page can tell the uploader.
+//
+// Secrets: UPLOAD_TOPIC, UPLOAD_PRIVATE (JWK, base64url), DATA_REPO (owner/name), and an SSH deploy
+// key with write access to DATA_REPO (configured by the workflow).
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const { execFileSync } = require('child_process');
+const ExcelJS = require('exceljs');
+
+const RELAY = 'https://ntfy.sh';
+const { UPLOAD_TOPIC: TOPIC, UPLOAD_PRIVATE: PRIV, DATA_REPO } = process.env;
+const DATA_DIR = 'Source of the Incentive';
+const BRANCHES = ['SGH-Cairo', 'SGH-Alex'];
+// What may be uploaded from the online page (category -> folder, allowed departments).
+const ALLOWED = {
+  allied: { folder: 'Allied', units: ['Anesthesia', 'Emergency Room', 'Intensive Care Unit', 'Laboratory', 'Radiation Oncology', 'Medical Imaging', 'Physiotherapy', 'Pharmacy', 'Home care'] },
+};
+const MAX_BYTES = 5 * 1024 * 1024;
+const work = path.join(process.cwd(), 'data-repo');
+
+const git = (...args) => execFileSync('git', args, { cwd: work, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
+const norm = (s) => String(s ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+function decrypt(body) {
+  const m = JSON.parse(body);
+  const jwk = JSON.parse(Buffer.from(PRIV, 'base64url').toString('utf8'));
+  const ecdh = crypto.createECDH('prime256v1');
+  ecdh.setPrivateKey(Buffer.from(jwk.d, 'base64url'));
+  const key = ecdh.computeSecret(Buffer.from(m.e, 'base64'));
+  const data = Buffer.from(m.c, 'base64');
+  const d = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(m.i, 'base64'));
+  d.setAuthTag(data.subarray(data.length - 16));
+  return JSON.parse(Buffer.concat([d.update(data.subarray(0, data.length - 16)), d.final()]).toString('utf8'));
+}
+
+/** The workbook must open and have a header with ID and Name (and a pay column); count its people. */
+async function inspect(buffer) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buffer);
+  for (const ws of wb.worksheets) {
+    for (let r = 1; r <= Math.min(10, ws.rowCount); r++) {
+      const cols = {};
+      ws.getRow(r).eachCell((c, i) => { cols[norm(c.text)] = i; });
+      if (!(cols.id && cols.name)) continue;
+      if (!(cols.incentives || cols.incentive || cols.totalsalary || cols.salary)) return { error: 'the file has no Incentives / Total Salary column' };
+      let rows = 0;
+      const months = new Set();
+      for (let k = r + 1; k <= ws.rowCount; k++) {
+        const row = ws.getRow(k);
+        const id = row.getCell(cols.id).text.trim();
+        const name = row.getCell(cols.name).text.trim();
+        if (!id && !name) continue;
+        rows++;
+        if (cols.month) months.add(`${row.getCell(cols.month).text.trim()}${cols.year ? ` ${row.getCell(cols.year).text.trim()}` : ''}`);
+      }
+      return rows ? { rows, months: [...months].filter(Boolean) } : { error: 'no rows with an ID or a name' };
+    }
+  }
+  return { error: 'no sheet with ID and Name columns (use the department template)' };
+}
+
+async function status(list) {
+  for (const st of list) {
+    await fetch(`${RELAY}/${TOPIC}s`, { method: 'POST', body: JSON.stringify(st), headers: { 'Content-Type': 'text/plain' } }).catch(() => {});
+  }
+}
+
+(async () => {
+  if (!TOPIC || !PRIV || !DATA_REPO) { console.log('Not configured (UPLOAD_TOPIC / UPLOAD_PRIVATE / DATA_REPO).'); return; }
+  const text = await (await fetch(`${RELAY}/${TOPIC}/json?poll=1&since=12h`)).text();
+  const messages = text.split('\n').filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } })
+    .filter((m) => m && m.event === 'message');
+  if (!messages.length) { console.log('No uploads.'); return; }
+
+  // DATA_REPO_URL: only for testing against a local copy
+  execFileSync('git', ['clone', '-q', '--depth', '1', process.env.DATA_REPO_URL || `git@github.com:${DATA_REPO}.git`, work], { stdio: 'inherit' });
+  git('config', 'user.name', 'dashboard-upload');
+  git('config', 'user.email', 'dashboard-upload@users.noreply.github.com');
+  const doneFile = path.join(work, 'uploads', 'processed.json');
+  let done = [];
+  try { done = JSON.parse(fs.readFileSync(doneFile, 'utf8')); } catch { /* first upload */ }
+  const fresh = messages.filter((m) => !done.includes(m.id));
+  if (!fresh.length) { console.log(`${messages.length} upload(s) on the relay, all already filed.`); return; }
+
+  const statuses = [];
+  const filed = [];
+  for (const msg of fresh) {
+    done.push(msg.id);
+    let p;
+    try {
+      const body = msg.attachment ? await (await fetch(msg.attachment.url)).text() : msg.message;
+      p = decrypt(body);
+    } catch (err) {
+      console.log(`${msg.id}: not a readable upload (${err.message})`);
+      continue; // not ours / expired: nothing to report back to
+    }
+    const fail = (note) => { statuses.push({ ref: p.ref, ok: false, note }); console.log(`${msg.id}: rejected — ${note}`); };
+    const allow = ALLOWED[p.category];
+    if (!allow) { fail('uploads from the online page are open for Allied / Closed Departments only'); continue; }
+    if (!BRANCHES.includes(p.branch)) { fail(`unknown branch ${p.branch}`); continue; }
+    if (!allow.units.includes(p.unit)) { fail(`unknown department ${p.unit}`); continue; }
+    const buffer = Buffer.from(String(p.data || ''), 'base64');
+    if (buffer.length > MAX_BYTES) { fail('the file is larger than 5 MB'); continue; }
+    if (buffer.subarray(0, 2).toString('latin1') !== 'PK') { fail('not an Excel .xlsx file'); continue; }
+    let info;
+    try { info = await inspect(buffer); } catch { info = { error: 'the file could not be opened as Excel' }; }
+    if (info.error) { fail(info.error); continue; }
+    const stamp = new Date(msg.time * 1000).toISOString().slice(0, 16).replace(/[-:T]/g, '');
+    const safe = String(p.name || 'upload.xlsx').replace(/[^\w .()&-]+/g, '_').replace(/\.xlsx?$/i, '').slice(0, 80);
+    const rel = path.posix.join(DATA_DIR, p.branch, allow.folder, p.unit, `${stamp} ${safe}.xlsx`);
+    fs.mkdirSync(path.join(work, path.dirname(rel)), { recursive: true });
+    fs.writeFileSync(path.join(work, rel), buffer);
+    filed.push(`${p.unit} (${String(p.by || 'unknown').slice(0, 40)})`);
+    statuses.push({ ref: p.ref, ok: true, note: `${info.rows} rows${info.months.length ? ` · ${info.months.join(', ')}` : ''}` });
+    console.log(`${msg.id}: ${rel} · ${info.rows} rows`);
+  }
+  fs.mkdirSync(path.dirname(doneFile), { recursive: true });
+  fs.writeFileSync(doneFile, `${JSON.stringify(done.slice(-1000), null, 0)}\n`);
+  git('add', '-A');
+  git('commit', '-q', '-m', filed.length ? `Upload from the dashboard: ${filed.join(', ')}` : 'Upload inbox: nothing filed');
+  // The publish workflow may have pushed meanwhile: rebase and retry.
+  for (let i = 0; i < 4; i++) {
+    try { git('pull', '-q', '--rebase'); git('push', '-q'); break; } catch (err) { if (i === 3) throw err; await new Promise((r) => setTimeout(r, 5000)); }
+  }
+  await status(statuses);
+  console.log(`${filed.length} filed, ${statuses.filter((s) => !s.ok).length} rejected.`);
+})().catch((err) => { console.error(err); process.exit(1); });

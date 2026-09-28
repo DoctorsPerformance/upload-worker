@@ -1,0 +1,50 @@
+# Every 5 minutes: file workbooks uploaded from the online dashboard into the private data
+# repository (see inbox.js). Public repository = free Actions minutes; no data or keys live here.
+name: Upload inbox
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: upload-inbox
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # only for the keep-alive commit below
+
+jobs:
+  inbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install --no-audit --no-fund --silent exceljs@4
+      - name: Deploy key for the data repository
+        env:
+          DATA_REPO_KEY: ${{ secrets.DATA_REPO_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DATA_REPO_KEY" | tr -d '\r' > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+      - name: File new uploads
+        run: node inbox.js
+        env:
+          UPLOAD_TOPIC: ${{ secrets.UPLOAD_TOPIC }}
+          UPLOAD_PRIVATE: ${{ secrets.UPLOAD_PRIVATE }}
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+      # GitHub pauses scheduled workflows in a repository without commits for 60 days.
+      - name: Keep the schedule alive
+        run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $(( 45 * 86400 )) ]; then
+            git config user.name "dashboard-upload"
+            git config user.email "dashboard-upload@users.noreply.github.com"
+            date -u +%FT%TZ > .keepalive
+            git add .keepalive && git commit -q -m "Keep the upload schedule alive" && git push -q
+          fi
