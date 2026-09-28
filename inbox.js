@@ -33,6 +33,7 @@ const ALLOWED = {
   legal: { folder: 'Separate/Legal Affairs', anyUnit: true },
   collection: { folder: 'Separate/CAM Collection', anyUnit: true },
   quarterly: { folder: 'Quarterly', anyUnit: true },
+  other: { folder: 'Other Incentives', anyUnit: true },
 };
 // letters, digits, spaces and a few marks; no slashes and no ".." (it becomes a folder name)
 const SAFE_UNIT = /^[\p{L}\p{N}][\p{L}\p{N} ,&()'-]{0,59}$/u;
